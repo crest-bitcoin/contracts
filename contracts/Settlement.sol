@@ -7,15 +7,28 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/interfaces/IERC1271.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "./WCBTC.sol";
 
 /**
  * @title Settlement
  * @dev Smart contract for handling RFQ settlements with support for
- * multiple signature types (EIP712, EIP1271, ETHSIGN)
+ * multiple signature types (EIP712, EIP1271, ETHSIGN) and native token support
  */
-contract Settlement is EIP712, Ownable {
+contract Settlement is EIP712, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using ECDSA for bytes32;
+
+    // Constants
+    address public constant NATIVE_TOKEN = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    uint256 public constant MAX_FEE_BASIS_POINTS = 1000; // 10% max fee
+
+    // WCBTC contract
+    WCBTC public immutable wcbtc;
+
+    // Fee configuration
+    uint256 public feeBasisPoints = 30; // 0.3% (30 basis points)
+    mapping(address => uint256) public collectedFees; // token => amount
 
     // Events
     event RFQSettled(
@@ -28,6 +41,9 @@ contract Settlement is EIP712, Ownable {
         uint256 amountOut,
         bool isRFQT
     );
+
+    event FeeUpdated(uint256 oldFee, uint256 newFee);
+    event FeesWithdrawn(address indexed token, address indexed to, uint256 amount);
 
     // Quote status tracker
     mapping(bytes32 => bool) public executedQuotes;
@@ -52,7 +68,10 @@ contract Settlement is EIP712, Ownable {
         bytes32 quoteId;
     }
 
-    constructor() EIP712("Settlement", "1") Ownable(msg.sender) {}
+    constructor(address _wcbtc) EIP712("Settlement", "1") Ownable(msg.sender) {
+        require(_wcbtc != address(0), "Invalid WCBTC address");
+        wcbtc = WCBTC(payable(_wcbtc));
+    }
 
     /**
      * @notice Creates a hash of the quote for signature verification
@@ -138,6 +157,46 @@ contract Settlement is EIP712, Ownable {
     }
 
     /**
+     * @notice Updates the fee basis points (only owner)
+     * @param newFeeBasisPoints New fee in basis points (1 basis point = 0.01%)
+     */
+    function setFeeBasisPoints(uint256 newFeeBasisPoints) external onlyOwner {
+        require(newFeeBasisPoints <= MAX_FEE_BASIS_POINTS, "Fee too high");
+        uint256 oldFee = feeBasisPoints;
+        feeBasisPoints = newFeeBasisPoints;
+        emit FeeUpdated(oldFee, newFeeBasisPoints);
+    }
+
+    /**
+     * @notice Gets the WCBTC contract address
+     */
+    function getWCBTCAddress() external view returns (address) {
+        return address(wcbtc);
+    }
+
+    /**
+     * @notice Withdraws collected fees (only owner)
+     * @param token Token address (use NATIVE_TOKEN for cBTC)
+     * @param to Address to send fees to
+     */
+    function withdrawFees(address token, address to) external onlyOwner {
+        require(to != address(0), "Invalid recipient");
+        uint256 amount = collectedFees[token];
+        require(amount > 0, "No fees to withdraw");
+
+        collectedFees[token] = 0;
+
+        if (token == NATIVE_TOKEN) {
+            (bool success, ) = payable(to).call{value: amount}("");
+            require(success, "cBTC transfer failed");
+        } else {
+            IERC20(token).safeTransfer(to, amount);
+        }
+
+        emit FeesWithdrawn(token, to, amount);
+    }
+
+    /**
      * @notice Settles an RFQ trade initiated by the user (RFQ-T)
      * @param params The quote parameters
      * @param marketMakerSignature The market maker's signature
@@ -145,12 +204,15 @@ contract Settlement is EIP712, Ownable {
     function settleRFQT(
         QuoteParams calldata params,
         bytes calldata marketMakerSignature
-    ) external {
+    ) external payable nonReentrant {
         // User must be the sender
         require(params.user == msg.sender, "Sender must be the user");
 
+        // Validate the trade
+        _validateRFQT(params, marketMakerSignature);
+
         // Execute the trade
-        _executeRFQ(params, marketMakerSignature, true);
+        _executeRFQT(params);
     }
 
     /**
@@ -163,31 +225,134 @@ contract Settlement is EIP712, Ownable {
         QuoteParams calldata params,
         bytes calldata marketMakerSignature,
         bytes calldata userSignature
-    ) external {
-        // Hash the quote data
-        bytes32 quoteHash = hashQuote(params);
+    ) external payable nonReentrant {
+        // RFQM only supports ERC20 tokens for tokenIn, but native tokens are allowed for tokenOut
+        require(params.tokenIn != NATIVE_TOKEN, "RFQM does not support native tokenIn");
 
-        // Verify user signature
-        require(
-            validateSignature(params.user, quoteHash, userSignature),
-            "Invalid user signature"
-        );
+        // Validate the trade
+        _validateRFQM(params, marketMakerSignature, userSignature);
 
         // Execute the trade
-        _executeRFQ(params, marketMakerSignature, false);
+        _executeRFQM(params);
     }
 
     /**
-     * @notice Internal function to execute an RFQ trade
+     * @notice Private function to execute RFQT trade
+     * @param params The quote parameters
+     */
+    function _executeRFQT(QuoteParams memory params) private {
+        // Calculate fee
+        (uint256 feeAmount, uint256 userReceiveAmount) = _calculateFee(params.amountOut);
+
+        // Handle tokenIn transfer (user to market maker)
+        if (params.tokenIn == NATIVE_TOKEN) {
+            require(msg.value == params.amountIn, "Incorrect cBTC amount");
+            (bool success, ) = payable(params.marketMaker).call{value: params.amountIn}("");
+            require(success, "cBTC transfer to market maker failed");
+        } else {
+            IERC20(params.tokenIn).safeTransferFrom(params.user, params.marketMaker, params.amountIn);
+        }
+
+        // Handle tokenOut transfer (market maker to user) and fee collection
+        if (params.tokenOut == NATIVE_TOKEN) {
+            // Market maker sends WCBTC, we unwrap and send native cBTC to user
+            IERC20(address(wcbtc)).safeTransferFrom(params.marketMaker, address(this), params.amountOut);
+
+            // Unwrap WCBTC to get native cBTC
+            wcbtc.withdraw(params.amountOut);
+
+            // Send native cBTC to user (minus fee)
+            (bool success, ) = payable(params.user).call{value: userReceiveAmount}("");
+            require(success, "cBTC transfer to user failed");
+
+            // Collect fee in native cBTC
+            if (feeAmount > 0) {
+                collectedFees[NATIVE_TOKEN] += feeAmount;
+            }
+        } else {
+            // Transfer from market maker to user (minus fee)
+            IERC20(params.tokenOut).safeTransferFrom(params.marketMaker, params.user, userReceiveAmount);
+
+            // Collect fee from market maker
+            if (feeAmount > 0) {
+                IERC20(params.tokenOut).safeTransferFrom(params.marketMaker, address(this), feeAmount);
+                collectedFees[params.tokenOut] += feeAmount;
+            }
+        }
+
+        // Emit event
+        emit RFQSettled(
+            params.quoteId,
+            params.user,
+            params.marketMaker,
+            params.tokenIn,
+            params.tokenOut,
+            params.amountIn,
+            params.amountOut,
+            true
+        );
+    }
+
+    /**
+     * @notice Private function to execute RFQM trade
+     * @param params The quote parameters
+     */
+    function _executeRFQM(QuoteParams memory params) private {
+        // Calculate fee
+        (uint256 feeAmount, uint256 userReceiveAmount) = _calculateFee(params.amountOut);
+
+        // Transfer tokenIn from user to market maker (always ERC20 in RFQM)
+        IERC20(params.tokenIn).safeTransferFrom(params.user, params.marketMaker, params.amountIn);
+
+        // Handle tokenOut transfer (market maker to user) and fee collection
+        if (params.tokenOut == NATIVE_TOKEN) {
+            // Market maker sends WCBTC, we unwrap and send native cBTC to user
+            IERC20(address(wcbtc)).safeTransferFrom(params.marketMaker, address(this), params.amountOut);
+
+            // Unwrap WCBTC to get native cBTC
+            wcbtc.withdraw(params.amountOut);
+
+            // Send native cBTC to user (minus fee)
+            (bool success, ) = payable(params.user).call{value: userReceiveAmount}("");
+            require(success, "cBTC transfer to user failed");
+
+            // Collect fee in native cBTC
+            if (feeAmount > 0) {
+                collectedFees[NATIVE_TOKEN] += feeAmount;
+            }
+        } else {
+            // Transfer from market maker to user (minus fee)
+            IERC20(params.tokenOut).safeTransferFrom(params.marketMaker, params.user, userReceiveAmount);
+
+            // Collect fee from market maker
+            if (feeAmount > 0) {
+                IERC20(params.tokenOut).safeTransferFrom(params.marketMaker, address(this), feeAmount);
+                collectedFees[params.tokenOut] += feeAmount;
+            }
+        }
+
+        // Emit event
+        emit RFQSettled(
+            params.quoteId,
+            params.user,
+            params.marketMaker,
+            params.tokenIn,
+            params.tokenOut,
+            params.amountIn,
+            params.amountOut,
+            false
+        );
+    }
+
+    /**
+     * @notice Private function to validate RFQT trade
      * @param params The quote parameters
      * @param marketMakerSignature The market maker's signature
-     * @param isRFQT Whether this is a RFQT trade (true) or RFQM trade (false)
      */
-    function _executeRFQ(
+    function _validateRFQT(
         QuoteParams memory params,
-        bytes calldata marketMakerSignature,
-        bool isRFQT
-    ) internal {
+        bytes calldata marketMakerSignature
+    ) private {
         // Check conditions
         require(!executedQuotes[params.quoteId], "Quote already executed");
         require(block.timestamp <= params.expiry, "Quote expired");
@@ -203,23 +368,55 @@ contract Settlement is EIP712, Ownable {
 
         // Mark quote as executed
         executedQuotes[params.quoteId] = true;
-
-        // Transfer tokenIn from user to market maker
-        IERC20(params.tokenIn).safeTransferFrom(params.user, params.marketMaker, params.amountIn);
-
-        // Transfer tokenOut from market maker to user
-        IERC20(params.tokenOut).safeTransferFrom(params.marketMaker, params.user, params.amountOut);
-
-        // Emit event
-        emit RFQSettled(
-            params.quoteId,
-            params.user,
-            params.marketMaker,
-            params.tokenIn,
-            params.tokenOut,
-            params.amountIn,
-            params.amountOut,
-            isRFQT
-        );
     }
+
+    /**
+     * @notice Private function to validate RFQM trade
+     * @param params The quote parameters
+     * @param marketMakerSignature The market maker's signature
+     * @param userSignature The user's signature
+     */
+    function _validateRFQM(
+        QuoteParams memory params,
+        bytes calldata marketMakerSignature,
+        bytes calldata userSignature
+    ) private {
+        // Check conditions
+        require(!executedQuotes[params.quoteId], "Quote already executed");
+        require(block.timestamp <= params.expiry, "Quote expired");
+
+        // Hash the quote data
+        bytes32 quoteHash = hashQuote(params);
+
+        // Verify user signature
+        require(
+            validateSignature(params.user, quoteHash, userSignature),
+            "Invalid user signature"
+        );
+
+        // Validate market maker's signature
+        require(
+            validateSignature(params.marketMaker, quoteHash, marketMakerSignature),
+            "Invalid market maker signature"
+        );
+
+        // Mark quote as executed
+        executedQuotes[params.quoteId] = true;
+    }
+
+    /**
+     * @notice Private function to calculate fee amounts
+     * @param amountOut The output amount
+     * @return feeAmount The calculated fee
+     * @return userReceiveAmount The amount user receives after fee
+     */
+    function _calculateFee(uint256 amountOut) private view returns (uint256 feeAmount, uint256 userReceiveAmount) {
+        feeAmount = (amountOut * feeBasisPoints) / 10000;
+        userReceiveAmount = amountOut - feeAmount;
+    }
+
+    /**
+     * @notice Allows the contract to receive cBTC
+     */
+    receive() external payable {}
 }

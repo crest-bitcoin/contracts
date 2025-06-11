@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: MIT
-
 pragma solidity ^0.8.20;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-contract Dollar is ERC20, Ownable {
+contract USD is ERC20, Ownable {
     address settlementContract;
 
-    constructor(address _settlementContract) ERC20("Dollar", "$") Ownable(msg.sender) {
+    constructor(address _settlementContract) ERC20("USD", "USD") Ownable(msg.sender) {
         settlementContract = _settlementContract;
     }
 

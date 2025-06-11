@@ -207,7 +207,7 @@ describe("Settlement", function () {
       const publicClient = await hre.viem.getPublicClient();
       const userNativeBefore = await publicClient.getBalance({ address: user.account.address });
       const userTokenBBefore = await tokenB.read.balanceOf([user.account.address]);
-      const mmNativeBefore = await publicClient.getBalance({ address: marketMaker.account.address });
+      const mmWCBTCBefore = await wcbtc.read.balanceOf([marketMaker.account.address]);
       const mmTokenBBefore = await tokenB.read.balanceOf([marketMaker.account.address]);
 
       // Execute trade
@@ -223,13 +223,13 @@ describe("Settlement", function () {
       // Check balances (accounting for gas costs in native balance checks)
       const userNativeAfter = await publicClient.getBalance({ address: user.account.address });
       const userTokenBAfter = await tokenB.read.balanceOf([user.account.address]);
-      const mmNativeAfter = await publicClient.getBalance({ address: marketMaker.account.address });
+      const mmWCBTCAfter = await wcbtc.read.balanceOf([marketMaker.account.address]);
       const mmTokenBAfter = await tokenB.read.balanceOf([marketMaker.account.address]);
 
       // User spent amountIn + gas, so check they spent at least amountIn
       expect(userNativeBefore - userNativeAfter >= amountIn).to.be.true;
       expect(userTokenBAfter).to.equal(userTokenBBefore + expectedUserReceive);
-      expect(mmNativeAfter).to.equal(mmNativeBefore + amountIn);
+      expect(mmWCBTCAfter).to.equal(mmWCBTCBefore + amountIn);
       expect(mmTokenBAfter).to.equal(mmTokenBBefore - amountOut);
     });
 

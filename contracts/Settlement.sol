@@ -247,8 +247,10 @@ contract Settlement is EIP712, Ownable, ReentrancyGuard {
         // Handle tokenIn transfer (user to market maker)
         if (params.tokenIn == NATIVE_TOKEN) {
             require(msg.value == params.amountIn, "Incorrect cBTC amount");
-            (bool success, ) = payable(params.marketMaker).call{value: params.amountIn}("");
-            require(success, "cBTC transfer to market maker failed");
+            // Wrap the native cBTC into WCBTC
+            wcbtc.deposit{value: params.amountIn}();
+            // Transfer WCBTC to market maker
+            IERC20(address(wcbtc)).safeTransfer(params.marketMaker, params.amountIn);
         } else {
             IERC20(params.tokenIn).safeTransferFrom(params.user, params.marketMaker, params.amountIn);
         }
